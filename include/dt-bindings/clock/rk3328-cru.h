@@ -97,6 +97,7 @@
 #define SCLK_MAC2IO_SRC		99
 #define SCLK_MAC2IO		100
 #define SCLK_MAC2PHY		101
+#define SCLK_MAC2IO_EXT		102
 
 /* dclk gates */
 #define DCLK_LCDC		120
@@ -192,7 +193,6 @@
 #define HCLK_VPU_PRE		324
 #define HCLK_VIO_PRE		325
 #define HCLK_VPU		326
-#define HCLK_VIO		327
 #define HCLK_BUS_PRE		328
 #define HCLK_PERI_PRE		329
 #define HCLK_H264		330

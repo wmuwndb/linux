@@ -14,6 +14,7 @@
  * @name:		identification string for chip
  * @channels:		channel specification
  * @num_channels:	number of channels
+ * @lock		protect sensor state
  */
 
 struct ad7606_chip_info {
@@ -23,6 +24,7 @@ struct ad7606_chip_info {
 
 /**
  * struct ad7606_state - driver instance specific data
+ * @lock		protect sensor state
  */
 
 struct ad7606_state {
@@ -37,6 +39,7 @@ struct ad7606_state {
 	bool				done;
 	void __iomem			*base_address;
 
+	struct mutex			lock; /* protect sensor state */
 	struct gpio_desc		*gpio_convst;
 	struct gpio_desc		*gpio_reset;
 	struct gpio_desc		*gpio_range;
@@ -54,7 +57,7 @@ struct ad7606_state {
 
 struct ad7606_bus_ops {
 	/* more methods added in future? */
-	int (*read_block)(struct device *, int, void *);
+	int (*read_block)(struct device *dev, int num, void *data);
 };
 
 int ad7606_probe(struct device *dev, int irq, void __iomem *base_address,

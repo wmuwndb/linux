@@ -59,23 +59,52 @@ static bool is_event_valid(u64 event)
 {
 	u64 valid_mask = EVENT_VALID_MASK;
 
-	if (cpu_has_feature(CPU_FTR_ARCH_300) && !cpu_has_feature(CPU_FTR_POWER9_DD1))
+	if (cpu_has_feature(CPU_FTR_ARCH_300))
 		valid_mask = p9_EVENT_VALID_MASK;
 
 	return !(event & ~valid_mask);
 }
 
-static u64 mmcra_sdar_mode(u64 event)
+static inline bool is_event_marked(u64 event)
 {
-	if (cpu_has_feature(CPU_FTR_ARCH_300) && !cpu_has_feature(CPU_FTR_POWER9_DD1))
-		return p9_SDAR_MODE(event) << MMCRA_SDAR_MODE_SHIFT;
+	if (event & EVENT_IS_MARKED)
+		return true;
 
-	return MMCRA_SDAR_MODE_TLB;
+	return false;
+}
+
+static void mmcra_sdar_mode(u64 event, unsigned long *mmcra)
+{
+	/*
+	 * MMCRA[SDAR_MODE] specifices how the SDAR should be updated in
+	 * continous sampling mode.
+	 *
+	 * Incase of Power8:
+	 * MMCRA[SDAR_MODE] will be programmed as "0b01" for continous sampling
+	 * mode and will be un-changed when setting MMCRA[63] (Marked events).
+	 *
+	 * Incase of Power9:
+	 * Marked event: MMCRA[SDAR_MODE] will be set to 0b00 ('No Updates'),
+	 *               or if group already have any marked events.
+	 * For rest
+	 *	MMCRA[SDAR_MODE] will be set from event code.
+	 *      If sdar_mode from event is zero, default to 0b01. Hardware
+	 *      requires that we set a non-zero value.
+	 */
+	if (cpu_has_feature(CPU_FTR_ARCH_300)) {
+		if (is_event_marked(event) || (*mmcra & MMCRA_SAMPLE_ENABLE))
+			*mmcra &= MMCRA_SDAR_MODE_NO_UPDATES;
+		else if (p9_SDAR_MODE(event))
+			*mmcra |=  p9_SDAR_MODE(event) << MMCRA_SDAR_MODE_SHIFT;
+		else
+			*mmcra |= MMCRA_SDAR_MODE_DCACHE;
+	} else
+		*mmcra |= MMCRA_SDAR_MODE_TLB;
 }
 
 static u64 thresh_cmp_val(u64 value)
 {
-	if (cpu_has_feature(CPU_FTR_ARCH_300) && !cpu_has_feature(CPU_FTR_POWER9_DD1))
+	if (cpu_has_feature(CPU_FTR_ARCH_300))
 		return value << p9_MMCRA_THR_CMP_SHIFT;
 
 	return value << MMCRA_THR_CMP_SHIFT;
@@ -83,7 +112,7 @@ static u64 thresh_cmp_val(u64 value)
 
 static unsigned long combine_from_event(u64 event)
 {
-	if (cpu_has_feature(CPU_FTR_ARCH_300) && !cpu_has_feature(CPU_FTR_POWER9_DD1))
+	if (cpu_has_feature(CPU_FTR_ARCH_300))
 		return p9_EVENT_COMBINE(event);
 
 	return EVENT_COMBINE(event);
@@ -91,7 +120,7 @@ static unsigned long combine_from_event(u64 event)
 
 static unsigned long combine_shift(unsigned long pmc)
 {
-	if (cpu_has_feature(CPU_FTR_ARCH_300) && !cpu_has_feature(CPU_FTR_POWER9_DD1))
+	if (cpu_has_feature(CPU_FTR_ARCH_300))
 		return p9_MMCR1_COMBINE_SHIFT(pmc);
 
 	return MMCR1_COMBINE_SHIFT(pmc);
@@ -117,6 +146,88 @@ static bool is_thresh_cmp_valid(u64 event)
 		return false;
 
 	return true;
+}
+
+static inline u64 isa207_find_source(u64 idx, u32 sub_idx)
+{
+	u64 ret = PERF_MEM_NA;
+
+	switch(idx) {
+	case 0:
+		/* Nothing to do */
+		break;
+	case 1:
+		ret = PH(LVL, L1);
+		break;
+	case 2:
+		ret = PH(LVL, L2);
+		break;
+	case 3:
+		ret = PH(LVL, L3);
+		break;
+	case 4:
+		if (sub_idx <= 1)
+			ret = PH(LVL, LOC_RAM);
+		else if (sub_idx > 1 && sub_idx <= 2)
+			ret = PH(LVL, REM_RAM1);
+		else
+			ret = PH(LVL, REM_RAM2);
+		ret |= P(SNOOP, HIT);
+		break;
+	case 5:
+		ret = PH(LVL, REM_CCE1);
+		if ((sub_idx == 0) || (sub_idx == 2) || (sub_idx == 4))
+			ret |= P(SNOOP, HIT);
+		else if ((sub_idx == 1) || (sub_idx == 3) || (sub_idx == 5))
+			ret |= P(SNOOP, HITM);
+		break;
+	case 6:
+		ret = PH(LVL, REM_CCE2);
+		if ((sub_idx == 0) || (sub_idx == 2))
+			ret |= P(SNOOP, HIT);
+		else if ((sub_idx == 1) || (sub_idx == 3))
+			ret |= P(SNOOP, HITM);
+		break;
+	case 7:
+		ret = PM(LVL, L1);
+		break;
+	}
+
+	return ret;
+}
+
+void isa207_get_mem_data_src(union perf_mem_data_src *dsrc, u32 flags,
+							struct pt_regs *regs)
+{
+	u64 idx;
+	u32 sub_idx;
+	u64 sier;
+	u64 val;
+
+	/* Skip if no SIER support */
+	if (!(flags & PPMU_HAS_SIER)) {
+		dsrc->val = 0;
+		return;
+	}
+
+	sier = mfspr(SPRN_SIER);
+	val = (sier & ISA207_SIER_TYPE_MASK) >> ISA207_SIER_TYPE_SHIFT;
+	if (val == 1 || val == 2) {
+		idx = (sier & ISA207_SIER_LDST_MASK) >> ISA207_SIER_LDST_SHIFT;
+		sub_idx = (sier & ISA207_SIER_DATA_SRC_MASK) >> ISA207_SIER_DATA_SRC_SHIFT;
+
+		dsrc->val = isa207_find_source(idx, sub_idx);
+		dsrc->val |= (val == 1) ? P(OP, LOAD) : P(OP, STORE);
+	}
+}
+
+void isa207_get_mem_weight(u64 *weight)
+{
+	u64 mmcra = mfspr(SPRN_MMCRA);
+	u64 exp = MMCRA_THR_CTR_EXP(mmcra);
+	u64 mantissa = MMCRA_THR_CTR_MANT(mmcra);
+
+	*weight = mantissa << (2 * exp);
 }
 
 int isa207_get_constraint(u64 event, unsigned long *maskp, unsigned long *valp)
@@ -180,7 +291,7 @@ int isa207_get_constraint(u64 event, unsigned long *maskp, unsigned long *valp)
 		value |= CNST_L1_QUAL_VAL(cache);
 	}
 
-	if (event & EVENT_IS_MARKED) {
+	if (is_event_marked(event)) {
 		mask  |= CNST_SAMPLE_MASK;
 		value |= CNST_SAMPLE_VAL(event >> EVENT_SAMPLE_SHIFT);
 	}
@@ -276,7 +387,7 @@ int isa207_compute_mmcr(u64 event[], int n_ev,
 		}
 
 		/* In continuous sampling mode, update SDAR on TLB miss */
-		mmcra |= mmcra_sdar_mode(event[i]);
+		mmcra_sdar_mode(event[i], &mmcra);
 
 		if (event[i] & EVENT_IS_L1) {
 			cache = event[i] >> EVENT_CACHE_SEL_SHIFT;
@@ -285,7 +396,7 @@ int isa207_compute_mmcr(u64 event[], int n_ev,
 			mmcr1 |= (cache & 1) << MMCR1_DC_QUAL_SHIFT;
 		}
 
-		if (event[i] & EVENT_IS_MARKED) {
+		if (is_event_marked(event[i])) {
 			mmcra |= MMCRA_SAMPLE_ENABLE;
 
 			val = (event[i] >> EVENT_SAMPLE_SHIFT) & EVENT_SAMPLE_MASK;
@@ -375,8 +486,8 @@ static int find_alternative(u64 event, const unsigned int ev_alt[][MAX_ALT], int
 	return -1;
 }
 
-int isa207_get_alternatives(u64 event, u64 alt[],
-				const unsigned int ev_alt[][MAX_ALT], int size)
+int isa207_get_alternatives(u64 event, u64 alt[], int size, unsigned int flags,
+					const unsigned int ev_alt[][MAX_ALT])
 {
 	int i, j, num_alt = 0;
 	u64 alt_event;
@@ -390,6 +501,31 @@ int isa207_get_alternatives(u64 event, u64 alt[],
 			if (alt_event && alt_event != event)
 				alt[num_alt++] = alt_event;
 		}
+	}
+
+	if (flags & PPMU_ONLY_COUNT_RUN) {
+		/*
+		 * We're only counting in RUN state, so PM_CYC is equivalent to
+		 * PM_RUN_CYC and PM_INST_CMPL === PM_RUN_INST_CMPL.
+		 */
+		j = num_alt;
+		for (i = 0; i < num_alt; ++i) {
+			switch (alt[i]) {
+			case 0x1e:			/* PMC_CYC */
+				alt[j++] = 0x600f4;	/* PM_RUN_CYC */
+				break;
+			case 0x600f4:
+				alt[j++] = 0x1e;
+				break;
+			case 0x2:			/* PM_INST_CMPL */
+				alt[j++] = 0x500fa;	/* PM_RUN_INST_CMPL */
+				break;
+			case 0x500fa:
+				alt[j++] = 0x2;
+				break;
+			}
+		}
+		num_alt = j;
 	}
 
 	return num_alt;

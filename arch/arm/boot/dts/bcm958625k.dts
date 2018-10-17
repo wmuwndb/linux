@@ -65,6 +65,10 @@
 	status = "okay";
 };
 
+&ehci0 {
+	status = "okay";
+};
+
 &nand {
 	nandcs@0 {
 		compatible = "brcm,nandcs";
@@ -101,6 +105,10 @@
 			reg = <0x04000000 0x3c000000>;
 		};
 	};
+};
+
+&ohci0 {
+	status = "okay";
 };
 
 &pcie0 {
@@ -237,10 +245,10 @@
 			reg = <4>;
 		};
 
-		port@5 {
-			ethernet = <&amac0>;
+		port@8 {
+			ethernet = <&amac2>;
 			label = "cpu";
-			reg = <5>;
+			reg = <8>;
 			fixed-link {
 				speed = <1000>;
 				full-duplex;
@@ -254,5 +262,13 @@
 };
 
 &uart1 {
+	status = "okay";
+};
+
+&usb3_phy {
+	status = "okay";
+};
+
+&xhci {
 	status = "okay";
 };

@@ -92,8 +92,7 @@ int ide_queue_pc_tail(ide_drive_t *drive, struct gendisk *disk,
 	struct request *rq;
 	int error;
 
-	rq = blk_get_request(drive->queue, REQ_OP_DRV_IN, __GFP_RECLAIM);
-	scsi_req_init(rq);
+	rq = blk_get_request(drive->queue, REQ_OP_DRV_IN, 0);
 	ide_req(rq)->type = ATA_PRIV_MISC;
 	rq->special = (char *)pc;
 
@@ -107,7 +106,8 @@ int ide_queue_pc_tail(ide_drive_t *drive, struct gendisk *disk,
 	memcpy(scsi_req(rq)->cmd, pc->c, 12);
 	if (drive->media == ide_tape)
 		scsi_req(rq)->cmd[13] = REQ_IDETAPE_PC1;
-	error = blk_execute_rq(drive->queue, disk, rq, 0);
+	blk_execute_rq(drive->queue, disk, rq, 0);
+	error = scsi_req(rq)->result ? -EIO : 0;
 put_req:
 	blk_put_request(rq);
 	return error;
@@ -199,7 +199,7 @@ void ide_prep_sense(ide_drive_t *drive, struct request *rq)
 	memset(sense, 0, sizeof(*sense));
 
 	blk_rq_init(rq->q, sense_rq);
-	scsi_req_init(sense_rq);
+	scsi_req_init(req);
 
 	err = blk_rq_map_kern(drive->queue, sense_rq, sense, sense_len,
 			      GFP_NOIO);
@@ -272,7 +272,7 @@ void ide_retry_pc(ide_drive_t *drive)
 	ide_requeue_and_plug(drive, failed_rq);
 	if (ide_queue_sense_rq(drive, pc)) {
 		blk_start_request(failed_rq);
-		ide_complete_rq(drive, -EIO, blk_rq_bytes(failed_rq));
+		ide_complete_rq(drive, BLK_STS_IOERR, blk_rq_bytes(failed_rq));
 	}
 }
 EXPORT_SYMBOL_GPL(ide_retry_pc);
@@ -282,7 +282,7 @@ int ide_cd_expiry(ide_drive_t *drive)
 	struct request *rq = drive->hwif->rq;
 	unsigned long wait = 0;
 
-	debug_log("%s: rq->cmd[0]: 0x%x\n", __func__, rq->cmd[0]);
+	debug_log("%s: scsi_req(rq)->cmd[0]: 0x%x\n", __func__, scsi_req(rq)->cmd[0]);
 
 	/*
 	 * Some commands are *slow* and normally take a long time to complete.
@@ -436,7 +436,8 @@ static ide_startstop_t ide_pc_intr(ide_drive_t *drive)
 
 	/* No more interrupts */
 	if ((stat & ATA_DRQ) == 0) {
-		int uptodate, error;
+		int uptodate;
+		blk_status_t error;
 
 		debug_log("Packet command completed, %d bytes transferred\n",
 			  blk_rq_bytes(rq));
@@ -454,7 +455,7 @@ static ide_startstop_t ide_pc_intr(ide_drive_t *drive)
 			debug_log("%s: I/O error\n", drive->name);
 
 			if (drive->media != ide_tape)
-				pc->rq->errors++;
+				scsi_req(pc->rq)->result++;
 
 			if (scsi_req(rq)->cmd[0] == REQUEST_SENSE) {
 				printk(KERN_ERR PFX "%s: I/O error in request "
@@ -462,7 +463,7 @@ static ide_startstop_t ide_pc_intr(ide_drive_t *drive)
 				return ide_do_reset(drive);
 			}
 
-			debug_log("[cmd %x]: check condition\n", rq->cmd[0]);
+			debug_log("[cmd %x]: check condition\n", scsi_req(rq)->cmd[0]);
 
 			/* Retry operation */
 			ide_retry_pc(drive);
@@ -488,16 +489,16 @@ static ide_startstop_t ide_pc_intr(ide_drive_t *drive)
 			drive->failed_pc = NULL;
 
 		if (ata_misc_request(rq)) {
-			rq->errors = 0;
-			error = 0;
+			scsi_req(rq)->result = 0;
+			error = BLK_STS_OK;
 		} else {
 
 			if (blk_rq_is_passthrough(rq) && uptodate <= 0) {
-				if (rq->errors == 0)
-					rq->errors = -EIO;
+				if (scsi_req(rq)->result == 0)
+					scsi_req(rq)->result = -EIO;
 			}
 
-			error = uptodate ? 0 : -EIO;
+			error = uptodate ? BLK_STS_OK : BLK_STS_IOERR;
 		}
 
 		ide_complete_rq(drive, error, blk_rq_bytes(rq));
@@ -530,7 +531,7 @@ static ide_startstop_t ide_pc_intr(ide_drive_t *drive)
 		ide_pad_transfer(drive, write, bcount);
 
 	debug_log("[cmd %x] transferred %d bytes, padded %d bytes, resid: %u\n",
-		  rq->cmd[0], done, bcount, scsi_req(rq)->resid_len);
+		  scsi_req(rq)->cmd[0], done, bcount, scsi_req(rq)->resid_len);
 
 	/* And set the interrupt handler again */
 	ide_set_handler(drive, ide_pc_intr, timeout);

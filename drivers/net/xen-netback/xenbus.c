@@ -224,7 +224,7 @@ static void xenvif_debugfs_addif(struct xenvif *vif)
 
 			snprintf(filename, sizeof(filename), "io_ring_q%d", i);
 			pfile = debugfs_create_file(filename,
-						    S_IRUSR | S_IWUSR,
+						    0600,
 						    vif->xenvif_dbg_root,
 						    &vif->queues[i],
 						    &xenvif_dbg_io_ring_ops_fops);
@@ -235,7 +235,7 @@ static void xenvif_debugfs_addif(struct xenvif *vif)
 
 		if (vif->ctrl_irq) {
 			pfile = debugfs_create_file("ctrl",
-						    S_IRUSR,
+						    0400,
 						    vif->xenvif_dbg_root,
 						    vif,
 						    &xenvif_dbg_ctrl_ops_fops);
@@ -495,26 +495,26 @@ static void backend_disconnect(struct backend_info *be)
 	struct xenvif *vif = be->vif;
 
 	if (vif) {
+		unsigned int num_queues = vif->num_queues;
 		unsigned int queue_index;
-		struct xenvif_queue *queues;
 
 		xen_unregister_watchers(vif);
 #ifdef CONFIG_DEBUG_FS
 		xenvif_debugfs_delif(vif);
 #endif /* CONFIG_DEBUG_FS */
 		xenvif_disconnect_data(vif);
-		for (queue_index = 0;
-		     queue_index < vif->num_queues;
-		     ++queue_index)
+
+		/* At this point some of the handlers may still be active
+		 * so we need to have additional synchronization here.
+		 */
+		vif->num_queues = 0;
+		synchronize_net();
+
+		for (queue_index = 0; queue_index < num_queues; ++queue_index)
 			xenvif_deinit_queue(&vif->queues[queue_index]);
 
-		spin_lock(&vif->lock);
-		queues = vif->queues;
-		vif->num_queues = 0;
+		vfree(vif->queues);
 		vif->queues = NULL;
-		spin_unlock(&vif->lock);
-
-		vfree(queues);
 
 		xenvif_disconnect_ctrl(vif);
 	}
@@ -977,8 +977,8 @@ static void connect(struct backend_info *be)
 	}
 
 	/* Use the number of queues requested by the frontend */
-	be->vif->queues = vzalloc(requested_num_queues *
-				  sizeof(struct xenvif_queue));
+	be->vif->queues = vzalloc(array_size(requested_num_queues,
+					     sizeof(struct xenvif_queue)));
 	if (!be->vif->queues) {
 		xenbus_dev_fatal(dev, -ENOMEM,
 				 "allocating queues");

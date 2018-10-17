@@ -19,6 +19,7 @@
  *
  */
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +28,9 @@
 #include <linux/bitmap.h>
 #include <linux/time64.h>
 
-#include "../util.h"
+#include <stdbool.h>
+/* perl needs the following define, right after including stdbool.h */
+#define HAS_BOOL
 #include <EXTERN.h>
 #include <perl.h>
 
@@ -532,7 +535,7 @@ static int perl_stop_script(void)
 	return 0;
 }
 
-static int perl_generate_script(struct pevent *pevent, const char *outfile)
+static int perl_generate_script(struct tep_handle *pevent, const char *outfile)
 {
 	struct event_format *event = NULL;
 	struct format_field *f;

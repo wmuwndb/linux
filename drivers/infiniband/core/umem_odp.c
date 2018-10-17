@@ -38,10 +38,44 @@
 #include <linux/slab.h>
 #include <linux/export.h>
 #include <linux/vmalloc.h>
+#include <linux/hugetlb.h>
+#include <linux/interval_tree_generic.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_umem.h>
 #include <rdma/ib_umem_odp.h>
+
+/*
+ * The ib_umem list keeps track of memory regions for which the HW
+ * device request to receive notification when the related memory
+ * mapping is changed.
+ *
+ * ib_umem_lock protects the list.
+ */
+
+static u64 node_start(struct umem_odp_node *n)
+{
+	struct ib_umem_odp *umem_odp =
+			container_of(n, struct ib_umem_odp, interval_tree);
+
+	return ib_umem_start(umem_odp->umem);
+}
+
+/* Note that the representation of the intervals in the interval tree
+ * considers the ending point as contained in the interval, while the
+ * function ib_umem_end returns the first address which is not contained
+ * in the umem.
+ */
+static u64 node_last(struct umem_odp_node *n)
+{
+	struct ib_umem_odp *umem_odp =
+			container_of(n, struct ib_umem_odp, interval_tree);
+
+	return ib_umem_end(umem_odp->umem) - 1;
+}
+
+INTERVAL_TREE_DEFINE(struct umem_odp_node, rb, u64, __subtree_last,
+		     node_start, node_last, static, rbt_ib_umem)
 
 static void ib_umem_notifier_start_account(struct ib_umem *item)
 {
@@ -152,6 +186,7 @@ static void ib_umem_notifier_release(struct mmu_notifier *mn,
 	rbt_ib_umem_for_each_in_range(&context->umem_tree, 0,
 				      ULLONG_MAX,
 				      ib_umem_notifier_release_trampoline,
+				      true,
 				      NULL);
 	up_read(&context->umem_rwsem);
 }
@@ -165,24 +200,6 @@ static int invalidate_page_trampoline(struct ib_umem *item, u64 start,
 	return 0;
 }
 
-static void ib_umem_notifier_invalidate_page(struct mmu_notifier *mn,
-					     struct mm_struct *mm,
-					     unsigned long address)
-{
-	struct ib_ucontext *context = container_of(mn, struct ib_ucontext, mn);
-
-	if (!context->invalidate_range)
-		return;
-
-	ib_ucontext_notifier_start_account(context);
-	down_read(&context->umem_rwsem);
-	rbt_ib_umem_for_each_in_range(&context->umem_tree, address,
-				      address + PAGE_SIZE,
-				      invalidate_page_trampoline, NULL);
-	up_read(&context->umem_rwsem);
-	ib_ucontext_notifier_end_account(context);
-}
-
 static int invalidate_range_start_trampoline(struct ib_umem *item, u64 start,
 					     u64 end, void *cookie)
 {
@@ -191,22 +208,31 @@ static int invalidate_range_start_trampoline(struct ib_umem *item, u64 start,
 	return 0;
 }
 
-static void ib_umem_notifier_invalidate_range_start(struct mmu_notifier *mn,
+static int ib_umem_notifier_invalidate_range_start(struct mmu_notifier *mn,
 						    struct mm_struct *mm,
 						    unsigned long start,
-						    unsigned long end)
+						    unsigned long end,
+						    bool blockable)
 {
 	struct ib_ucontext *context = container_of(mn, struct ib_ucontext, mn);
+	int ret;
 
 	if (!context->invalidate_range)
-		return;
+		return 0;
+
+	if (blockable)
+		down_read(&context->umem_rwsem);
+	else if (!down_read_trylock(&context->umem_rwsem))
+		return -EAGAIN;
 
 	ib_ucontext_notifier_start_account(context);
-	down_read(&context->umem_rwsem);
-	rbt_ib_umem_for_each_in_range(&context->umem_tree, start,
+	ret = rbt_ib_umem_for_each_in_range(&context->umem_tree, start,
 				      end,
-				      invalidate_range_start_trampoline, NULL);
+				      invalidate_range_start_trampoline,
+				      blockable, NULL);
 	up_read(&context->umem_rwsem);
+
+	return ret;
 }
 
 static int invalidate_range_end_trampoline(struct ib_umem *item, u64 start,
@@ -226,17 +252,21 @@ static void ib_umem_notifier_invalidate_range_end(struct mmu_notifier *mn,
 	if (!context->invalidate_range)
 		return;
 
+	/*
+	 * TODO: we currently bail out if there is any sleepable work to be done
+	 * in ib_umem_notifier_invalidate_range_start so we shouldn't really block
+	 * here. But this is ugly and fragile.
+	 */
 	down_read(&context->umem_rwsem);
 	rbt_ib_umem_for_each_in_range(&context->umem_tree, start,
 				      end,
-				      invalidate_range_end_trampoline, NULL);
+				      invalidate_range_end_trampoline, true, NULL);
 	up_read(&context->umem_rwsem);
 	ib_ucontext_notifier_end_account(context);
 }
 
 static const struct mmu_notifier_ops ib_umem_notifiers = {
 	.release                    = ib_umem_notifier_release,
-	.invalidate_page            = ib_umem_notifier_invalidate_page,
 	.invalidate_range_start     = ib_umem_notifier_invalidate_range_start,
 	.invalidate_range_end       = ib_umem_notifier_invalidate_range_end,
 };
@@ -254,11 +284,11 @@ struct ib_umem *ib_alloc_odp_umem(struct ib_ucontext *context,
 	if (!umem)
 		return ERR_PTR(-ENOMEM);
 
-	umem->context   = context;
-	umem->length    = size;
-	umem->address   = addr;
-	umem->page_size = PAGE_SIZE;
-	umem->writable  = 1;
+	umem->context    = context;
+	umem->length     = size;
+	umem->address    = addr;
+	umem->page_shift = PAGE_SHIFT;
+	umem->writable   = 1;
 
 	odp_data = kzalloc(sizeof(*odp_data), GFP_KERNEL);
 	if (!odp_data) {
@@ -270,13 +300,15 @@ struct ib_umem *ib_alloc_odp_umem(struct ib_ucontext *context,
 	mutex_init(&odp_data->umem_mutex);
 	init_completion(&odp_data->notifier_completion);
 
-	odp_data->page_list = vzalloc(pages * sizeof(*odp_data->page_list));
+	odp_data->page_list =
+		vzalloc(array_size(pages, sizeof(*odp_data->page_list)));
 	if (!odp_data->page_list) {
 		ret = -ENOMEM;
 		goto out_odp_data;
 	}
 
-	odp_data->dma_list = vzalloc(pages * sizeof(*odp_data->dma_list));
+	odp_data->dma_list =
+		vzalloc(array_size(pages, sizeof(*odp_data->dma_list)));
 	if (!odp_data->dma_list) {
 		ret = -ENOMEM;
 		goto out_page_list;
@@ -306,7 +338,8 @@ out_umem:
 }
 EXPORT_SYMBOL(ib_alloc_odp_umem);
 
-int ib_umem_odp_get(struct ib_ucontext *context, struct ib_umem *umem)
+int ib_umem_odp_get(struct ib_ucontext *context, struct ib_umem *umem,
+		    int access)
 {
 	int ret_val;
 	struct pid *our_pid;
@@ -314,6 +347,24 @@ int ib_umem_odp_get(struct ib_ucontext *context, struct ib_umem *umem)
 
 	if (!mm)
 		return -EINVAL;
+
+	if (access & IB_ACCESS_HUGETLB) {
+		struct vm_area_struct *vma;
+		struct hstate *h;
+
+		down_read(&mm->mmap_sem);
+		vma = find_vma(mm, ib_umem_start(umem));
+		if (!vma || !is_vm_hugetlb_page(vma)) {
+			up_read(&mm->mmap_sem);
+			return -EINVAL;
+		}
+		h = hstate_vma(vma);
+		umem->page_shift = huge_page_shift(h);
+		up_read(&mm->mmap_sem);
+		umem->hugetlb = 1;
+	} else {
+		umem->hugetlb = 0;
+	}
 
 	/* Prevent creating ODP MRs in child processes */
 	rcu_read_lock();
@@ -325,7 +376,6 @@ int ib_umem_odp_get(struct ib_ucontext *context, struct ib_umem *umem)
 		goto out_mm;
 	}
 
-	umem->hugetlb = 0;
 	umem->odp_data = kzalloc(sizeof(*umem->odp_data), GFP_KERNEL);
 	if (!umem->odp_data) {
 		ret_val = -ENOMEM;
@@ -338,15 +388,17 @@ int ib_umem_odp_get(struct ib_ucontext *context, struct ib_umem *umem)
 	init_completion(&umem->odp_data->notifier_completion);
 
 	if (ib_umem_num_pages(umem)) {
-		umem->odp_data->page_list = vzalloc(ib_umem_num_pages(umem) *
-					    sizeof(*umem->odp_data->page_list));
+		umem->odp_data->page_list =
+			vzalloc(array_size(sizeof(*umem->odp_data->page_list),
+					   ib_umem_num_pages(umem)));
 		if (!umem->odp_data->page_list) {
 			ret_val = -ENOMEM;
 			goto out_odp_data;
 		}
 
-		umem->odp_data->dma_list = vzalloc(ib_umem_num_pages(umem) *
-					  sizeof(*umem->odp_data->dma_list));
+		umem->odp_data->dma_list =
+			vzalloc(array_size(sizeof(*umem->odp_data->dma_list),
+					   ib_umem_num_pages(umem)));
 		if (!umem->odp_data->dma_list) {
 			ret_val = -ENOMEM;
 			goto out_page_list;
@@ -504,7 +556,6 @@ out:
 static int ib_umem_odp_map_dma_single_page(
 		struct ib_umem *umem,
 		int page_index,
-		u64 base_virt_addr,
 		struct page *page,
 		u64 access_mask,
 		unsigned long current_seq)
@@ -527,7 +578,7 @@ static int ib_umem_odp_map_dma_single_page(
 	if (!(umem->odp_data->dma_list[page_index])) {
 		dma_addr = ib_dma_map_page(dev,
 					   page,
-					   0, PAGE_SIZE,
+					   0, BIT(umem->page_shift),
 					   DMA_BIDIRECTIONAL);
 		if (ib_dma_mapping_error(dev, dma_addr)) {
 			ret = -EFAULT;
@@ -555,8 +606,9 @@ out:
 	if (remove_existing_mapping && umem->context->invalidate_range) {
 		invalidate_page_trampoline(
 			umem,
-			base_virt_addr + (page_index * PAGE_SIZE),
-			base_virt_addr + ((page_index+1)*PAGE_SIZE),
+			ib_umem_start(umem) + (page_index >> umem->page_shift),
+			ib_umem_start(umem) + ((page_index + 1) >>
+					       umem->page_shift),
 			NULL);
 		ret = -EAGAIN;
 	}
@@ -595,10 +647,10 @@ int ib_umem_odp_map_dma_pages(struct ib_umem *umem, u64 user_virt, u64 bcnt,
 	struct task_struct *owning_process  = NULL;
 	struct mm_struct   *owning_mm       = NULL;
 	struct page       **local_page_list = NULL;
-	u64 off;
-	int j, k, ret = 0, start_idx, npages = 0;
-	u64 base_virt_addr;
+	u64 page_mask, off;
+	int j, k, ret = 0, start_idx, npages = 0, page_shift;
 	unsigned int flags = 0;
+	phys_addr_t p = 0;
 
 	if (access_mask == 0)
 		return -EINVAL;
@@ -611,9 +663,10 @@ int ib_umem_odp_map_dma_pages(struct ib_umem *umem, u64 user_virt, u64 bcnt,
 	if (!local_page_list)
 		return -ENOMEM;
 
-	off = user_virt & (~PAGE_MASK);
-	user_virt = user_virt & PAGE_MASK;
-	base_virt_addr = user_virt;
+	page_shift = umem->page_shift;
+	page_mask = ~(BIT(page_shift) - 1);
+	off = user_virt & (~page_mask);
+	user_virt = user_virt & page_mask;
 	bcnt += off; /* Charge for the first page offset as well. */
 
 	owning_process = get_pid_task(umem->context->tgid, PIDTYPE_PID);
@@ -631,13 +684,13 @@ int ib_umem_odp_map_dma_pages(struct ib_umem *umem, u64 user_virt, u64 bcnt,
 	if (access_mask & ODP_WRITE_ALLOWED_BIT)
 		flags |= FOLL_WRITE;
 
-	start_idx = (user_virt - ib_umem_start(umem)) >> PAGE_SHIFT;
+	start_idx = (user_virt - ib_umem_start(umem)) >> page_shift;
 	k = start_idx;
 
 	while (bcnt > 0) {
-		const size_t gup_num_pages =
-			min_t(size_t, ALIGN(bcnt, PAGE_SIZE) / PAGE_SIZE,
-			      PAGE_SIZE / sizeof(struct page *));
+		const size_t gup_num_pages = min_t(size_t,
+				(bcnt + BIT(page_shift) - 1) >> page_shift,
+				PAGE_SIZE / sizeof(struct page *));
 
 		down_read(&owning_mm->mmap_sem);
 		/*
@@ -656,14 +709,25 @@ int ib_umem_odp_map_dma_pages(struct ib_umem *umem, u64 user_virt, u64 bcnt,
 			break;
 
 		bcnt -= min_t(size_t, npages << PAGE_SHIFT, bcnt);
-		user_virt += npages << PAGE_SHIFT;
 		mutex_lock(&umem->odp_data->umem_mutex);
-		for (j = 0; j < npages; ++j) {
+		for (j = 0; j < npages; j++, user_virt += PAGE_SIZE) {
+			if (user_virt & ~page_mask) {
+				p += PAGE_SIZE;
+				if (page_to_phys(local_page_list[j]) != p) {
+					ret = -EFAULT;
+					break;
+				}
+				put_page(local_page_list[j]);
+				continue;
+			}
+
 			ret = ib_umem_odp_map_dma_single_page(
-				umem, k, base_virt_addr, local_page_list[j],
-				access_mask, current_seq);
+					umem, k, local_page_list[j],
+					access_mask, current_seq);
 			if (ret < 0)
 				break;
+
+			p = page_to_phys(local_page_list[j]);
 			k++;
 		}
 		mutex_unlock(&umem->odp_data->umem_mutex);
@@ -707,8 +771,8 @@ void ib_umem_odp_unmap_dma_pages(struct ib_umem *umem, u64 virt,
 	 * invalidations, so we must make sure we free each page only
 	 * once. */
 	mutex_lock(&umem->odp_data->umem_mutex);
-	for (addr = virt; addr < bound; addr += (u64)umem->page_size) {
-		idx = (addr - ib_umem_start(umem)) / PAGE_SIZE;
+	for (addr = virt; addr < bound; addr += BIT(umem->page_shift)) {
+		idx = (addr - ib_umem_start(umem)) >> umem->page_shift;
 		if (umem->odp_data->page_list[idx]) {
 			struct page *page = umem->odp_data->page_list[idx];
 			dma_addr_t dma = umem->odp_data->dma_list[idx];
@@ -742,3 +806,46 @@ void ib_umem_odp_unmap_dma_pages(struct ib_umem *umem, u64 virt,
 	mutex_unlock(&umem->odp_data->umem_mutex);
 }
 EXPORT_SYMBOL(ib_umem_odp_unmap_dma_pages);
+
+/* @last is not a part of the interval. See comment for function
+ * node_last.
+ */
+int rbt_ib_umem_for_each_in_range(struct rb_root_cached *root,
+				  u64 start, u64 last,
+				  umem_call_back cb,
+				  bool blockable,
+				  void *cookie)
+{
+	int ret_val = 0;
+	struct umem_odp_node *node, *next;
+	struct ib_umem_odp *umem;
+
+	if (unlikely(start == last))
+		return ret_val;
+
+	for (node = rbt_ib_umem_iter_first(root, start, last - 1);
+			node; node = next) {
+		/* TODO move the blockable decision up to the callback */
+		if (!blockable)
+			return -EAGAIN;
+		next = rbt_ib_umem_iter_next(node, start, last - 1);
+		umem = container_of(node, struct ib_umem_odp, interval_tree);
+		ret_val = cb(umem->umem, start, last, cookie) || ret_val;
+	}
+
+	return ret_val;
+}
+EXPORT_SYMBOL(rbt_ib_umem_for_each_in_range);
+
+struct ib_umem_odp *rbt_ib_umem_lookup(struct rb_root_cached *root,
+				       u64 addr, u64 length)
+{
+	struct umem_odp_node *node;
+
+	node = rbt_ib_umem_iter_first(root, addr, addr + length - 1);
+	if (node)
+		return container_of(node, struct ib_umem_odp, interval_tree);
+	return NULL;
+
+}
+EXPORT_SYMBOL(rbt_ib_umem_lookup);

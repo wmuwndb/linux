@@ -82,9 +82,10 @@ octeon_alloc_soft_command_resp(struct octeon_device    *oct,
 }
 
 int octnet_send_nic_data_pkt(struct octeon_device *oct,
-			     struct octnic_data_pkt *ndata)
+			     struct octnic_data_pkt *ndata,
+			     int xmit_more)
 {
-	int ring_doorbell = 1;
+	int ring_doorbell = !xmit_more;
 
 	return octeon_send_command(oct, ndata->q_no, ring_doorbell, &ndata->cmd,
 				   ndata->buf, ndata->datasize,
@@ -100,14 +101,16 @@ static void octnet_link_ctrl_callback(struct octeon_device *oct,
 
 	nctrl = (struct octnic_ctrl_pkt *)sc->ctxptr;
 
-	/* Call the callback function if status is OK.
-	 * Status is OK only if a response was expected and core returned
-	 * success.
+	/* Call the callback function if status is zero (meaning OK) or status
+	 * contains a firmware status code bigger than zero (meaning the
+	 * firmware is reporting an error).
 	 * If no response was expected, status is OK if the command was posted
 	 * successfully.
 	 */
-	if (!status && nctrl->cb_fn)
+	if ((!status || status > FIRMWARE_STATUS_CODE(0)) && nctrl->cb_fn) {
+		nctrl->status = status;
 		nctrl->cb_fn(nctrl);
+	}
 
 	octeon_free_soft_command(oct, sc);
 }

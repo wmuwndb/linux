@@ -28,7 +28,6 @@ struct shmob_drm_crtc {
 	int dpms;
 
 	const struct shmob_drm_format_info *format;
-	void *cache;
 	unsigned long dma[2];
 	unsigned int line_size;
 	bool started;
@@ -47,7 +46,6 @@ struct shmob_drm_connector {
 };
 
 int shmob_drm_crtc_create(struct shmob_drm_device *sdev);
-void shmob_drm_crtc_enable_vblank(struct shmob_drm_device *sdev, bool enable);
 void shmob_drm_crtc_finish_page_flip(struct shmob_drm_crtc *scrtc);
 void shmob_drm_crtc_suspend(struct shmob_drm_crtc *scrtc);
 void shmob_drm_crtc_resume(struct shmob_drm_crtc *scrtc);
